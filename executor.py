@@ -76,6 +76,25 @@ class BooleanConditionEngine:
 
 class ExcelConditionEngine:
     
+    @staticmethod
+    def _digits(s: str) -> str:
+        return re.sub(r'\D+', '', str(s))
+
+    def _token_in_filename(self, token: str, filename: str) -> bool:
+        """Compara token com o nome do arquivo, tolerando pontuação/locale.
+        - Se tem dígitos e não tem letras → compara por dígitos apenas (CPF, contrato, dinheiro).
+        - Caso contrário → substring case-insensitive normal.
+        """
+        t = str(token).strip().lower()
+        if not t:
+            return False
+        has_digit = bool(re.search(r'\d', t))
+        has_alpha = bool(re.search(r'[a-zA-Z]', t))
+
+        if has_digit and not has_alpha:
+            return self._digits(t) in self._digits(filename)
+        return t in filename
+
     def __init__(self, path, cols, prims, expr):
         self.path = Path(path)
         self.cols = cols
@@ -102,7 +121,7 @@ class ExcelConditionEngine:
             for n, col in self.cols.items():
                 try:
                     val = str(row[col]).strip() if col in row else ""
-                    md[n] = val.lower() in filename_lower if val else False
+                    md[n] = self._token_in_filename(val, filename_lower) if val else False
                 except Exception:
                     md[n] = False
             if self.boolean.evaluate(md, filename_lower):
@@ -118,7 +137,7 @@ class ExcelConditionEngine:
             for n, col in self.cols.items():
                 try:
                     val = str(row[col]).strip() if col in row else ""
-                    md[n] = val.lower() in filename_lower if val else False
+                    md[n] = self._token_in_filename(val, filename_lower) if val else False
                 except Exception:
                     md[n] = False
             if self.boolean.evaluate(md, filename_lower):
@@ -128,6 +147,21 @@ class ExcelConditionEngine:
                     if col is not None and col in row:
                         vals.append(str(row[col]).strip())
                 return sep.join(vals) if vals else None
+        return None
+
+    def find_matching_row(self, filename):
+        """Retorna a primeira linha do Excel que satisfaz a expressão para este arquivo."""
+        if self.df is None or len(self.df) == 0:
+            return None
+        fname = filename.lower()
+
+        for _, row in self.df.iterrows():
+            md = {}
+            for n, col in self.cols.items():
+                raw = str(row[col]).strip() if col in row else ""
+                md[n] = self._token_in_filename(raw, fname)  # usa normalização (abaixo)
+            if self.boolean.evaluate(md, fname):
+                return row
         return None
 
     def all_matching_rows(self, filename):
@@ -143,7 +177,7 @@ class ExcelConditionEngine:
             for n, col in self.cols.items():
                 try:
                     val = str(row[col]).strip() if col in row else ""
-                    md[n] = val.lower() in filename_lower if val else False
+                    md[n] = self._token_in_filename(val, filename_lower) if val else False
                 except Exception:
                     md[n] = False
             if self.boolean.evaluate(md, filename_lower):
@@ -398,14 +432,36 @@ class Executor:
             final_name = src.name
             if self.rename_enabled:
                 pattern = self.rename_pattern
-                for lit in re.findall(r'"([^"]+)"', pattern):
-                    pattern = pattern.replace(f'"{lit}"', lit)
-                # variáveis de condição !Cond!
-                for var in re.findall(r'!([^!]+)!', pattern):
-                    val = ""
-                    if hasattr(self.ce, "get_principais_values"):
-                        val = self.ce.get_principais_values(src.stem, self.sep) or ""
-                    pattern = pattern.replace(f'!{var}!', val)
+                # remove aspas do padrão ("texto" -> texto)
+                pattern = re.sub(r'"([^"]+)"', r'\1', pattern)
+
+                # tenta obter a linha do Excel que casa com este arquivo
+                row = None
+                values = {}
+
+                try:
+                    from pandas import Series  # só para type hint leve
+                except Exception:
+                    pass
+
+                if isinstance(self.ce, ExcelConditionEngine):
+                    row = self.ce.find_matching_row(src.stem)  # << nova função (abaixo)
+                    if row is not None:
+                        for nome, col in self.ce.cols.items():
+                            if col in row:
+                                values[nome] = str(row[col]).strip()
+
+                # sanear caracteres inválidos em nomes de arquivo no Windows
+                def _sanitize(v: str) -> str:
+                    v = str(v)
+                    return re.sub(r'[\\/:*?"<>|]+', '', v)
+
+                # troca cada !Campo! pelo valor correspondente
+                def _repl(m):
+                    key = m.group(1)
+                    return _sanitize(values.get(key, ""))
+
+                pattern = re.sub(r'!([^!]+)!', _repl, pattern)
                 final_name = pattern + src.suffix
 
             # copy file ou pasta
@@ -509,7 +565,10 @@ class Executor:
             if self.ce.df is not None:
                 fname = f.stem.lower()
                 for _, row in self.ce.df.iterrows():
-                    md = { n: (str(row[col]).strip().lower() in fname) for n, col in self.ce.cols.items() if row[col] }
+                    md = {}
+                    for n, col in self.ce.cols.items():
+                        val = str(row[col]).strip() if col in row else ""
+                        md[n] = self.ce._token_in_filename(val, fname) if val else False
                     if self.ce.boolean.evaluate(md, fname):
                         matched.append(row)
 
